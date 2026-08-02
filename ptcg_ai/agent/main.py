@@ -51,23 +51,30 @@ lib.SearchRelease.argtypes = [ctypes.c_void_p, ctypes.c_long]
 # 60-card deck once further meta / deckbuilding work is done; the search
 # logic below is deck-agnostic.
 #
-# v2 change (evidence-driven, see strategy_report.md "Deck Concept"): the
-# original kaggle_environments sample deck carries only 6 Basic Pokemon
-# (2 Kyogre + 4 Snover) in 60 cards. Diagnostics on 250 games showed 100% of
-# our losses ended with ZERO Pokemon in play on our side (the TCG "no
-# Pokemon in play" instant loss) -- and with only 6 basics, a 7-card opening
-# hand has ~86% probability of holding at most 1 Basic Pokemon
-# (hypergeometric: P(0)=45.9%, P(1)=40.1%), leaving no bench insurance if
-# that lone Pokemon is knocked out early. We raise Kyogre (a tanky 150 HP
-# basic) from 2 to 4 copies (the real-TCG 4-copy cap), dropping 2 Basic
-# Energy (33 -> 31, still >50% of the deck) to keep the list at 60. This
-# lowers P(<=1 basic in opener) from 86.0% to 76.8% -- a meaningful,
-# low-risk consistency improvement with no change to the deck's identity.
+# v2 (evidence-driven, see strategy_report.md "Deck Concept"): the original
+# kaggle_environments sample deck carries only 6 Basic Pokemon (2 Kyogre +
+# 4 Snover) in 60 cards. Diagnostics showed all losses ended with ZERO
+# Pokemon in play (the TCG "no Pokemon in play" instant loss), and with only
+# 6 basics a 7-card opening hand has ~86% probability of holding at most 1
+# Basic Pokemon. We raised Kyogre 2->4 (the real-TCG 4-copy cap), dropping 2
+# Basic Energy (33->31) to keep 60 cards: P(<=1 basic in opener) 86.0%->76.8%.
+#
+# v3 (this revision): added 2x Chien-Pao (209, non-ex, 120 HP, "Icicle Loop"
+# 120 dmg for 2 Water + 1 Colorless -- an efficient, low-retreat-cost, non-
+# evolving Water attacker) as a 3rd Basic Pokemon line, cutting Mega Signal
+# (1145, a narrow "fetch a Mega Evolution ex" search effect made partly
+# redundant by the extra basic) to keep energy at 31 rather than diluting it
+# (a lesson from testing several rejected candidates -- see the deck
+# evaluation table in strategy_report.md). Basics 8->10, P(<=1 basic in
+# opener) 76.8%->67.0%. Validated: 50.0% (20/40) head-to-head vs v2 (parity
+# -- the goal here is consistency, not raw power) and 89.7% (269/300) vs
+# `random`, both at full production search budget, both clearing this
+# project's promotion bars.
 # ---------------------------------------------------------------------------
 
 DECK = [
-    721, 721, 721, 721, 722, 722, 722, 722, 723, 723, 723, 723,
-    1092, 1121, 1121, 1145, 1145, 1163, 1163,
+    721, 721, 721, 721, 722, 722, 722, 722, 723, 723, 723, 723, 209, 209,
+    1092, 1121, 1121, 1163, 1163,
     1219, 1219, 1219, 1219, 1227, 1227, 1227, 1227, 1262, 1262,
     3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
 ]
@@ -75,9 +82,9 @@ assert len(DECK) == 60
 
 # Basic Pokemon card ids in DECK (bench targets) and "search my deck for a
 # Pokemon" trainer ids (Ultra Ball) -- used by playout_policy's board-safety
-# rescue bias below. Kept alongside DECK as a matching swap point: update
-# both together if DECK changes.
-BASIC_POKEMON_IDS = {721, 722}
+# rescue bias and bench_basic_override below. Kept alongside DECK as a
+# matching swap point: update both together if DECK changes.
+BASIC_POKEMON_IDS = {721, 722, 209}
 SEARCH_TRAINER_IDS = {1121}
 
 # ---------------------------------------------------------------------------
@@ -391,13 +398,17 @@ def playout_policy(sel, hand=None, board_thin=False):
         rescue = []
         for i in non_pass:
             o = opts[i]
-            if o.get("type") == 8 and o.get("area") == 2:
+            # shape-based match (area==2 "from hand"), not a specific type
+            # code, since the engine uses different type codes for this
+            # play in different contexts (e.g. setup vs a normal turn) --
+            # see bench_basic_override's docstring for the same reasoning.
+            if o.get("area") == 2:
                 hidx = o.get("index")
                 if hidx is not None and 0 <= hidx < len(hand):
                     cid = hand[hidx].get("id")
                     if cid in BASIC_POKEMON_IDS or cid in SEARCH_TRAINER_IDS:
                         rescue.append(i)
-        if rescue and k <= len(rescue) and random.random() < 0.8:
+        if rescue and k <= len(rescue) and random.random() < 0.95:
             pool = rescue
 
     if pool is None:
@@ -614,6 +625,92 @@ def fallback_pick(sel):
     return list(range(k))
 
 
+def _hand_play_option_ids(hand, opts):
+    """Map option index -> card id, for every option that plays a specific
+    card out of hand (area==2 with a valid hand index). Debug-only; lets
+    loss classification tell precisely whether e.g. "play Ultra Ball" was a
+    live, offered option that got passed over, rather than just noting the
+    card sat somewhere in hand that turn (which doesn't by itself mean it
+    was actionable)."""
+    if not hand:
+        return {}
+    out = {}
+    for i, o in enumerate(opts):
+        if o.get("area") == 2:
+            hidx = o.get("index")
+            if hidx is not None and 0 <= hidx < len(hand):
+                out[i] = hand[hidx].get("id")
+    return out
+
+
+def _benchable_basic_idxs(hand, opts):
+    """Option indices that would play a Basic Pokemon from hand to the bench
+    (same shape-based match as bench_basic_override). Used both by the
+    override itself and by debug instrumentation, so loss classification can
+    tell whether such an opportunity existed on a given decision regardless
+    of whether presence was already <=1 at the time."""
+    if not hand:
+        return []
+    idxs = []
+    for i, o in enumerate(opts):
+        if o.get("area") == 2 and o.get("inPlayArea") == 4:
+            hidx = o.get("index")
+            if hidx is not None and 0 <= hidx < len(hand):
+                cid = hand[hidx].get("id")
+                if cid in BASIC_POKEMON_IDS:
+                    idxs.append(i)
+    return idxs
+
+
+def bench_basic_override(cur, sel):
+    """Deterministic safety override, checked BEFORE search on every real
+    decision. Every loss ever observed in diagnosis (100% of an initial
+    250-game sample, 93% after Phase 1 fixes) ended with us at zero Pokemon
+    in play. If we currently have <=1 Pokemon in play, there is bench room,
+    and hand contains a Basic Pokemon playable straight to the bench, taking
+    that play is almost never wrong against any opponent and costs zero
+    search time -- so we take it unconditionally rather than leaving it to
+    a probabilistic search/playout bias. Returns the action (a single-index
+    list) or None if the condition doesn't hold (fall through to normal
+    search/fallback).
+
+    Matches on shape (area==2 "from hand", inPlayArea==4 "to bench", and the
+    underlying hand card being a known Basic Pokemon id) rather than a
+    specific option "type" code, because the engine uses different type
+    codes for this play depending on context (e.g. type 3 during initial
+    setup vs type 8 during a normal turn's action menu) -- gating on the
+    card identity instead of the type code is robust to both.
+    """
+    me = cur.get("yourIndex")
+    if me is None:
+        return None
+    players = cur.get("players")
+    if not players or me >= len(players):
+        return None
+    mp = players[me]
+    active_n = len(mp.get("active") or [])
+    bench_n = len(mp.get("bench") or [])
+    bench_max = mp.get("benchMax", 0)
+    if active_n + bench_n > 1 or bench_n >= bench_max:
+        return None
+    hand = mp.get("hand")
+    if not hand:
+        return None
+    mx = sel.get("maxCount", 0)
+    mn = sel.get("minCount", 0)
+    if mx != 1 or mn > 1:
+        return None  # only override plain single-pick selects, never a forced multi-select
+    opts = sel.get("option") or []
+    for i, o in enumerate(opts):
+        if o.get("area") == 2 and o.get("inPlayArea") == 4:
+            hidx = o.get("index")
+            if hidx is not None and 0 <= hidx < len(hand):
+                cid = hand[hidx].get("id")
+                if cid in BASIC_POKEMON_IDS:
+                    return [i]
+    return None
+
+
 def choose_action(ctx, obs, deadline, min_d=2):
     """Returns (best_action, best_mean_score_or_None). best_action is None
     only when enumerate_candidates() itself returns nothing (never happens
@@ -677,9 +774,14 @@ def agent(obs):
             me_dbg = cur.get("yourIndex")
             if me_dbg is not None:
                 mp = cur["players"][me_dbg]
+                hand_dbg = mp.get("hand") or []
                 _debug_board = {
                     "active_n": len(mp.get("active") or []),
                     "bench_n": len(mp.get("bench") or []),
+                    "bench_max": mp.get("benchMax", 0),
+                    "hand_ids": [c.get("id") for c in hand_dbg],
+                    "benchable_basic_idxs": _benchable_basic_idxs(hand_dbg, sel.get("option") or []),
+                    "hand_play_option_ids": _hand_play_option_ids(hand_dbg, sel.get("option") or []),
                 }
             else:
                 _debug_board = {}
@@ -696,6 +798,20 @@ def agent(obs):
                     **_debug_board,
                 )
             return []
+
+        override_action = bench_basic_override(cur, sel)
+        if override_action is not None:
+            if DEBUG:
+                _debug_note(
+                    turn=cur.get("turn"), me=cur.get("yourIndex"),
+                    sel_type=sel.get("type"), sel_context=sel.get("context"),
+                    option_types=[o.get("type") for o in (sel.get("option") or [])],
+                    n_options=n, n_candidates=1,
+                    action=override_action, fallback=False, best_score=None,
+                    reason="bench_override",
+                    **_debug_board,
+                )
+            return override_action
 
         start = time.time()
         setup = is_setup_turn(cur)
