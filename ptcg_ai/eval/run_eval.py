@@ -27,6 +27,8 @@ def run_games(n, opponent_name):
     wins = losses = draws = bad = 0
     my_rewards = []
     per_game = []
+    streak = 0
+    best_streak = 0
     t0 = time.time()
 
     for i in range(n):
@@ -46,18 +48,24 @@ def run_games(n, opponent_name):
         if my_status in BAD_STATUSES:
             bad += 1
             outcome = f"BAD:{my_status}"
+            streak = 0
         elif my_reward == 1:
             wins += 1
             outcome = "WIN"
+            streak += 1
+            best_streak = max(best_streak, streak)
         elif my_reward == -1:
             losses += 1
             outcome = "LOSS"
+            streak = 0
         else:
             draws += 1
             outcome = "DRAW"
+            streak = 0
 
         per_game.append((i, our_seat, statuses, rewards, outcome))
-        print(f"game {i:3d} seat={our_seat} statuses={statuses} rewards={rewards} -> {outcome}")
+        print(f"game {i:3d} seat={our_seat} statuses={statuses} rewards={rewards} "
+              f"-> {outcome}  (streak={streak})")
 
     elapsed = time.time() - t0
     decided = wins + losses + draws
@@ -67,7 +75,7 @@ def run_games(n, opponent_name):
     print("=" * 64)
     print(f"opponent={opponent_name} games={n} wins={wins} losses={losses} "
           f"draws={draws} bad_status={bad}")
-    print(f"winrate={winrate:.1%}  mean_reward={mean_reward:.3f}")
+    print(f"winrate={winrate:.1%}  mean_reward={mean_reward:.3f}  best_streak={best_streak}")
     print(f"wallclock={elapsed:.1f}s total, {elapsed / n:.2f}s/game")
 
     return {
@@ -79,6 +87,7 @@ def run_games(n, opponent_name):
         "bad_status": bad,
         "winrate": winrate,
         "mean_reward": mean_reward,
+        "best_streak": best_streak,
         "elapsed_s": elapsed,
     }
 

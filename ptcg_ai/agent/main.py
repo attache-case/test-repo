@@ -73,6 +73,13 @@ DECK = [
 ]
 assert len(DECK) == 60
 
+# Basic Pokemon card ids in DECK (bench targets) and "search my deck for a
+# Pokemon" trainer ids (Ultra Ball) -- used by playout_policy's board-safety
+# rescue bias below. Kept alongside DECK as a matching swap point: update
+# both together if DECK changes.
+BASIC_POKEMON_IDS = {721, 722}
+SEARCH_TRAINER_IDS = {1121}
+
 # ---------------------------------------------------------------------------
 # Tunables (kept as simple module-level constants per spec)
 # ---------------------------------------------------------------------------
@@ -303,15 +310,20 @@ def heuristic_eval(obs, me):
     return max(-1.0, min(1.0, score))
 
 
-def playout_policy(sel):
+def playout_policy(sel, hand=None, board_thin=False):
     """Biased-random legal action for playouts. Tiered preference, each tier
     only used when it's non-empty and the pick size k fits it:
+      0. RESCUE (only when board_thin and hand is our own, i.e. this decision
+         is genuinely ours within the rollout): options that play a Basic
+         Pokemon from hand (bench it) or a "search my deck for a Pokemon"
+         trainer (Ultra Ball) straight from hand. Loss diagnosis showed
+         ~93% of losses end with us at zero Pokemon in play after our board
+         thinned to <=1 Pokemon; getting a spare into play/hand ASAP is the
+         single highest-value action available in that situation.
       1. attacks (option type 13) -- push the game toward a decision/win.
       2. "play to board" options (type 8 targeting inPlayArea 4, i.e. bench)
          -- covers both benching a new Pokemon and attaching energy to a
-         benched one; both develop the board, which loss diagnosis showed
-         is the single highest-leverage thing to reward (every observed
-         loss ended with us at zero Pokemon in play).
+         benched one; both develop the board.
       3. any other non-pass (type != 14) option.
       4. pass (type 14), only if nothing else fits.
     """
@@ -330,14 +342,28 @@ def playout_policy(sel):
     board_dev = [i for i in non_pass if opts[i].get("type") == 8 and opts[i].get("inPlayArea") == 4]
 
     pool = None
-    if attacks and k <= len(attacks) and random.random() < 0.55:
-        pool = attacks
-    elif board_dev and k <= len(board_dev) and random.random() < 0.55:
-        pool = board_dev
-    elif non_pass and k <= len(non_pass) and random.random() < 0.85:
-        pool = non_pass
-    else:
-        pool = idxs
+    if board_thin and hand:
+        rescue = []
+        for i in non_pass:
+            o = opts[i]
+            if o.get("type") == 8 and o.get("area") == 2:
+                hidx = o.get("index")
+                if hidx is not None and 0 <= hidx < len(hand):
+                    cid = hand[hidx].get("id")
+                    if cid in BASIC_POKEMON_IDS or cid in SEARCH_TRAINER_IDS:
+                        rescue.append(i)
+        if rescue and k <= len(rescue) and random.random() < 0.8:
+            pool = rescue
+
+    if pool is None:
+        if attacks and k <= len(attacks) and random.random() < 0.55:
+            pool = attacks
+        elif board_dev and k <= len(board_dev) and random.random() < 0.55:
+            pool = board_dev
+        elif non_pass and k <= len(non_pass) and random.random() < 0.85:
+            pool = non_pass
+        else:
+            pool = idxs
 
     k = min(k, len(pool))
     if k <= 0:
@@ -385,9 +411,16 @@ def _rollout_score_impl(ctx, obs, first_action, me, deadline):
             if steps >= DEPTH_CAP or time.time() > deadline:
                 return heuristic_eval(o, me)
             sel = o["select"]
+            cur_o = o["current"]
+            hand = None
+            board_thin = False
+            if cur_o.get("yourIndex") == me:
+                me_p = cur_o["players"][me]
+                hand = me_p.get("hand")
+                board_thin = (len(me_p.get("active") or []) + len(me_p.get("bench") or [])) <= 1
             success = False
             for _ in range(MAX_STEP_RETRIES):
-                act = playout_policy(sel)
+                act = playout_policy(sel, hand=hand, board_thin=board_thin)
                 out = json.loads(
                     lib.SearchStep(ctx, handle, arr(act), len(act)).decode()
                 )
