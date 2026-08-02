@@ -17,6 +17,7 @@ submission entrypoint.
 
 import ctypes
 import json
+import os
 import random
 import time
 from collections import Counter
@@ -72,6 +73,57 @@ MAX_STEP_RETRIES = 3         # retries on an invalid SearchStep during playout
 FILLER_CARD_ID = 3           # Basic {W} Energy -- padding for determinization pools
 
 _CTX = None  # lazily-created AgentStart() context, reused across decisions
+
+# ---------------------------------------------------------------------------
+# Optional debug instrumentation -- OFF by default so the Kaggle submission is
+# completely unaffected. Enable by setting the environment variable
+# PTCG_DEBUG=1 *before this module is imported* (eval/diagnostic scripts do
+# this). When enabled, `get_debug_stats()` exposes counters for fallback
+# usage and engine call failures, plus a ring buffer of the last dozen real
+# decisions, so a diagnostic harness can dump "why did we lose this game"
+# context for lost/drawn games.
+# ---------------------------------------------------------------------------
+
+DEBUG = os.environ.get("PTCG_DEBUG") == "1"
+_HISTORY_LEN = 12
+
+
+def _new_stats():
+    return {
+        "decisions": 0,
+        "fallback_decisions": 0,
+        "search_begin_fail": 0,
+        "search_step_fail": 0,
+        "rollout_ok": 0,
+        "rollout_fail": 0,
+        "history": [],
+    }
+
+
+_STATS = _new_stats() if DEBUG else None
+
+
+def reset_debug_stats():
+    """Reset the module-level debug counters/history. No-op unless
+    PTCG_DEBUG=1 was set before import. Call this before each game when
+    looping env.run() in one process, so stats don't bleed across games."""
+    global _STATS
+    if DEBUG:
+        _STATS = _new_stats()
+
+
+def get_debug_stats():
+    """Return the live debug stats dict, or None if PTCG_DEBUG is not set."""
+    return _STATS
+
+
+def _debug_note(**entry):
+    if not DEBUG or _STATS is None:
+        return
+    _STATS["decisions"] += 1
+    _STATS["history"].append(entry)
+    if len(_STATS["history"]) > _HISTORY_LEN:
+        del _STATS["history"][0]
 
 
 def arr(lst):
@@ -230,15 +282,26 @@ def rollout_score(ctx, obs, first_action, me, deadline):
     """SearchBegin -> apply first_action -> random playout to depth cap or
     terminal -> score. Returns None on any engine failure (caller skips it).
     Always frees the search session via SearchEnd before returning."""
+    s = _rollout_score_impl(ctx, obs, first_action, me, deadline)
+    if DEBUG and _STATS is not None:
+        _STATS["rollout_ok" if s is not None else "rollout_fail"] += 1
+    return s
+
+
+def _rollout_score_impl(ctx, obs, first_action, me, deadline):
     try:
         j = search_begin(ctx, obs)
         if not j.get("state"):
+            if DEBUG and _STATS is not None:
+                _STATS["search_begin_fail"] += 1
             return None
         handle = 0
         out = json.loads(
             lib.SearchStep(ctx, handle, arr(first_action), len(first_action)).decode()
         )
         if not out.get("state"):
+            if DEBUG and _STATS is not None:
+                _STATS["search_step_fail"] += 1
             return None
         handle += 1
         st = out["state"]
@@ -266,6 +329,8 @@ def rollout_score(ctx, obs, first_action, me, deadline):
                     handle += 1
                     success = True
                     break
+                elif DEBUG and _STATS is not None:
+                    _STATS["search_step_fail"] += 1
             if not success:
                 return heuristic_eval(o, me)
             steps += 1
@@ -374,18 +439,22 @@ def fallback_pick(sel):
 
 
 def choose_action(ctx, obs, deadline):
+    """Returns (best_action, best_mean_score_or_None). best_action is None
+    only when enumerate_candidates() itself returns nothing (never happens
+    in practice; see enumerate_candidates)."""
     cur = obs["current"]
     me = cur["yourIndex"]
     sel = obs["select"]
     candidates = enumerate_candidates(sel)
     if not candidates:
-        return None
+        return None, None
     if len(candidates) == 1:
-        return candidates[0]
+        return candidates[0], None
 
     num_cand = len(candidates)
     best_action = candidates[0]
     best_score = -2.0
+    any_scored = False
     for cand in candidates:
         if time.time() > deadline:
             break
@@ -405,7 +474,8 @@ def choose_action(ctx, obs, deadline):
             if mean > best_score:
                 best_score = mean
                 best_action = cand
-    return best_action
+                any_scored = True
+    return best_action, (best_score if any_scored else None)
 
 
 def _get_ctx():
@@ -425,29 +495,61 @@ def agent(obs):
 
         sel = obs["select"]
         n = len(sel.get("option") or [])
+        cur = obs.get("current") or {}
         if n == 0:
+            if DEBUG:
+                _STATS["fallback_decisions"] += 1
+                _debug_note(
+                    turn=cur.get("turn"), me=cur.get("yourIndex"),
+                    sel_type=sel.get("type"), n_options=0, n_candidates=0,
+                    action=[], fallback=True, best_score=None, reason="no_options",
+                )
             return []
 
         start = time.time()
         deadline = compute_deadline(obs, start)
         candidates = enumerate_candidates(sel)
         if len(candidates) <= 1:
-            return candidates[0] if candidates else fallback_pick(sel)
+            action = candidates[0] if candidates else fallback_pick(sel)
+            if DEBUG:
+                fb = not candidates
+                if fb:
+                    _STATS["fallback_decisions"] += 1
+                _debug_note(
+                    turn=cur.get("turn"), me=cur.get("yourIndex"),
+                    sel_type=sel.get("type"), n_options=n, n_candidates=len(candidates),
+                    action=action, fallback=fb, best_score=None, reason="single_candidate",
+                )
+            return action
 
         ctx = _get_ctx()
-        action = None
+        action, best_score = None, None
         try:
-            action = choose_action(ctx, obs, deadline)
+            action, best_score = choose_action(ctx, obs, deadline)
         finally:
             try:
                 lib.SearchEnd(ctx)
             except Exception:
                 pass
 
+        used_fallback = action is None
         if action is None:
             action = fallback_pick(sel)
+
+        if DEBUG:
+            if used_fallback:
+                _STATS["fallback_decisions"] += 1
+            _debug_note(
+                turn=cur.get("turn"), me=cur.get("yourIndex"),
+                sel_type=sel.get("type"), n_options=n, n_candidates=len(candidates),
+                action=action, fallback=used_fallback, best_score=best_score,
+                elapsed=round(time.time() - start, 3),
+                reason=("fallback" if used_fallback else ("no_rollout" if best_score is None else "search")),
+            )
         return action
     except Exception:
+        if DEBUG and _STATS is not None:
+            _STATS["fallback_decisions"] += 1
         try:
             return fallback_pick(obs.get("select"))
         except Exception:
