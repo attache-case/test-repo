@@ -88,6 +88,53 @@ BASIC_POKEMON_IDS = {721, 722, 209}
 SEARCH_TRAINER_IDS = {1121}
 
 # ---------------------------------------------------------------------------
+# Archetype tournament (ptcg_ai/train/artifacts/archetype_tournament.md):
+# v3 above was round-robin-tested (30 games/pairing, agent piloting both
+# sides, full search budget) against 5 further decks built from
+# ptcg_ai/train/artifacts/card_pool_catalog.md, modeled on recognizable
+# real-world archetypes. v3 won every pairing (77-97%, 85.3% overall,
+# clear #1 by Elo) and remains champion/active DECK. The other decklists
+# are kept here for reproducibility and future tournaments -- NOT used at
+# runtime (DECK above is always what's submitted).
+# ---------------------------------------------------------------------------
+ARCHETYPE_DECKS = {
+    "v3_champion": DECK,
+    "t1_lightning_aggro": (  # Big-Basic Aggro: Pikachu ex / Zekrom ex / Tapu Koko ex
+        [210] * 4 + [515] * 4 + [329] * 2
+        + [1224] * 4 + [1182] * 4 + [1121] * 4 + [1158] * 1 + [1174] * 3 + [1213] * 3
+        + [4] * 31
+    ),
+    "t2_grass_stage2": (  # Stage-2 Powerhouse: Mega Venusaur ex + Rare Candy, basics splash
+        [650] * 4 + [651] * 2 + [652] * 3 + [27] * 4 + [178] * 2
+        + [1079] * 4 + [1224] * 4 + [1182] * 2 + [1121] * 2 + [1158] * 1 + [1174] * 1
+        + [1] * 31
+    ),
+    "t3_tera_box": (  # Tera Box: Water/Fighting/Colorless ex+tera basics
+        [108] * 4 + [117] * 4 + [176] * 2
+        + [1224] * 4 + [1182] * 4 + [1121] * 4 + [1158] * 1 + [1174] * 3 + [1213] * 3
+        + [3] * 16 + [6] * 15
+    ),
+    "t4_fighting_spread": (  # Fighting Spread/bench-damage: Stonjourner / Ting-Lu / Terrakion
+        [682] * 4 + [41] * 4 + [607] * 2
+        + [1224] * 4 + [1182] * 4 + [1121] * 4 + [1158] * 1 + [1174] * 3 + [1213] * 3
+        + [6] * 31
+    ),
+    "t5_colorless_stall": (  # Disruption/Stall: Snorlax / Regigigas / Hop's Snorlax
+        [1072] * 4 + [251] * 4 + [304] * 2
+        + [1224] * 4 + [1186] * 2 + [1197] * 2 + [1121] * 4 + [1159] * 1 + [1117] * 3 + [1182] * 2
+        + [6] * 32
+    ),
+}
+ARCHETYPE_BASIC_IDS = {
+    "v3_champion": BASIC_POKEMON_IDS,
+    "t1_lightning_aggro": {210, 515, 329},
+    "t2_grass_stage2": {650, 27, 178},
+    "t3_tera_box": {108, 117, 176},
+    "t4_fighting_spread": {682, 41, 607},
+    "t5_colorless_stall": {1072, 251, 304},
+}
+
+# ---------------------------------------------------------------------------
 # Tunables (kept as simple module-level constants per spec)
 # ---------------------------------------------------------------------------
 
