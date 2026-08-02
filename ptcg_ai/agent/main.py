@@ -47,16 +47,29 @@ lib.SearchEnd.argtypes = [ctypes.c_void_p]
 lib.SearchRelease.argtypes = [ctypes.c_void_p, ctypes.c_long]
 
 # ---------------------------------------------------------------------------
-# Deck constant -- copied verbatim from kaggle_environments' cabt sample deck.
-# CLEARLY MARKED SWAP POINT: replace this list with a tuned 60-card deck once
-# meta / deckbuilding work is done; the search logic below is deck-agnostic.
+# Deck constant. CLEARLY MARKED SWAP POINT: replace this list with a tuned
+# 60-card deck once further meta / deckbuilding work is done; the search
+# logic below is deck-agnostic.
+#
+# v2 change (evidence-driven, see strategy_report.md "Deck Concept"): the
+# original kaggle_environments sample deck carries only 6 Basic Pokemon
+# (2 Kyogre + 4 Snover) in 60 cards. Diagnostics on 250 games showed 100% of
+# our losses ended with ZERO Pokemon in play on our side (the TCG "no
+# Pokemon in play" instant loss) -- and with only 6 basics, a 7-card opening
+# hand has ~86% probability of holding at most 1 Basic Pokemon
+# (hypergeometric: P(0)=45.9%, P(1)=40.1%), leaving no bench insurance if
+# that lone Pokemon is knocked out early. We raise Kyogre (a tanky 150 HP
+# basic) from 2 to 4 copies (the real-TCG 4-copy cap), dropping 2 Basic
+# Energy (33 -> 31, still >50% of the deck) to keep the list at 60. This
+# lowers P(<=1 basic in opener) from 86.0% to 76.8% -- a meaningful,
+# low-risk consistency improvement with no change to the deck's identity.
 # ---------------------------------------------------------------------------
 
 DECK = [
-    721, 721, 722, 722, 722, 722, 723, 723, 723, 723,
+    721, 721, 721, 721, 722, 722, 722, 722, 723, 723, 723, 723,
     1092, 1121, 1121, 1145, 1145, 1163, 1163,
     1219, 1219, 1219, 1219, 1227, 1227, 1227, 1227, 1262, 1262,
-    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
 ]
 assert len(DECK) == 60
 
@@ -64,13 +77,28 @@ assert len(DECK) == 60
 # Tunables (kept as simple module-level constants per spec)
 # ---------------------------------------------------------------------------
 
-TARGET_TIME = 0.8          # seconds, soft per-decision budget
-HARD_CAP = 1.5              # seconds, absolute per-decision budget
-DEPTH_CAP = 60               # max SearchStep applications per playout
-CANDIDATE_CAP = 24           # max candidate actions considered per decision
-MULTI_RANDOM_COMBOS = 8      # extra random combos tried for multi-select options
-MAX_STEP_RETRIES = 3         # retries on an invalid SearchStep during playout
-FILLER_CARD_ID = 3           # Basic {W} Energy -- padding for determinization pools
+TARGET_TIME = 1.2            # seconds, soft per-decision budget
+HARD_CAP = 3.0                # seconds, absolute per-decision budget
+SETUP_TURN_CUTOFF = 2         # turn <= this: treat as high-leverage "setup" (see below)
+SETUP_TARGET_TIME = 2.5       # soft budget for setup-phase decisions (more D, still headroom)
+SETUP_HARD_CAP = 4.5          # hard cap for setup-phase decisions
+SETUP_MIN_DETERMINIZATIONS = 8  # never go below this many determinizations during setup
+DEPTH_CAP = 90                # max SearchStep applications per playout
+CANDIDATE_CAP = 24            # max candidate actions considered per decision
+MULTI_RANDOM_COMBOS = 8       # extra random combos tried for multi-select options
+MAX_STEP_RETRIES = 3          # retries on an invalid SearchStep during playout
+FILLER_CARD_ID = 3            # Basic {W} Energy -- padding for determinization pools
+
+# heuristic_eval weights (rebalanced after loss diagnosis -- see report):
+# a "board presence" term was added because 100% of observed losses ended
+# with zero Pokemon in play on our side; the old weights (prize/hp/board/hand)
+# didn't explicitly reward keeping spare Pokemon in reserve.
+W_PRIZE = 0.40
+W_HP = 0.20
+W_BOARD_DEV = 0.10
+W_HAND = 0.05
+W_PRESENCE = 0.25
+PRESENCE_CAP = 3  # Pokemon count beyond which extra copies stop adding safety value
 
 _CTX = None  # lazily-created AgentStart() context, reused across decisions
 
@@ -254,13 +282,39 @@ def heuristic_eval(obs, me):
     board_diff = (board_dev(my) - board_dev(op)) / 10.0
     hand_diff = (my["handCount"] - op["handCount"]) / 10.0
 
-    score = 0.5 * prize_diff + 0.25 * hp_diff + 0.15 * board_diff + 0.10 * hand_diff
+    # Board presence / "don't get swept" term: reward having Pokemon in play
+    # up to a small cap, independent of HP or energy. This exists specifically
+    # because the terminal "no Pokemon in play" loss is instant and total --
+    # diagnosis showed every observed loss ended with our side at 0 Pokemon
+    # in play, so keeping a spare on the bench needs to be valuable even at a
+    # shallow, depth-capped leaf where the eventual KO hasn't happened yet.
+    def presence(p):
+        return min(len(p["active"]) + len(p["bench"]), PRESENCE_CAP) / PRESENCE_CAP
+
+    presence_diff = presence(my) - presence(op)
+
+    score = (
+        W_PRIZE * prize_diff
+        + W_HP * hp_diff
+        + W_BOARD_DEV * board_diff
+        + W_HAND * hand_diff
+        + W_PRESENCE * presence_diff
+    )
     return max(-1.0, min(1.0, score))
 
 
 def playout_policy(sel):
-    """Uniform-random legal action, lightly biased away from "pass" (type 14)
-    when other options exist, per spec's cheap-improvement suggestion."""
+    """Biased-random legal action for playouts. Tiered preference, each tier
+    only used when it's non-empty and the pick size k fits it:
+      1. attacks (option type 13) -- push the game toward a decision/win.
+      2. "play to board" options (type 8 targeting inPlayArea 4, i.e. bench)
+         -- covers both benching a new Pokemon and attaching energy to a
+         benched one; both develop the board, which loss diagnosis showed
+         is the single highest-leverage thing to reward (every observed
+         loss ended with us at zero Pokemon in play).
+      3. any other non-pass (type != 14) option.
+      4. pass (type 14), only if nothing else fits.
+    """
     n = len(sel.get("option") or [])
     if n == 0:
         return []
@@ -270,8 +324,21 @@ def playout_policy(sel):
     mn = min(mn, mx)
     k = random.randint(mn, mx) if mx >= mn else mn
     idxs = list(range(n))
-    non_pass = [i for i in idxs if sel["option"][i].get("type") != 14]
-    pool = non_pass if (non_pass and k <= len(non_pass) and random.random() < 0.85) else idxs
+    opts = sel["option"]
+    non_pass = [i for i in idxs if opts[i].get("type") != 14]
+    attacks = [i for i in non_pass if opts[i].get("type") == 13]
+    board_dev = [i for i in non_pass if opts[i].get("type") == 8 and opts[i].get("inPlayArea") == 4]
+
+    pool = None
+    if attacks and k <= len(attacks) and random.random() < 0.55:
+        pool = attacks
+    elif board_dev and k <= len(board_dev) and random.random() < 0.55:
+        pool = board_dev
+    elif non_pass and k <= len(non_pass) and random.random() < 0.85:
+        pool = non_pass
+    else:
+        pool = idxs
+
     k = min(k, len(pool))
     if k <= 0:
         return []
@@ -390,33 +457,49 @@ def enumerate_candidates(sel):
     return cands
 
 
-def determinizations_for(num_candidates, remaining):
-    """Adaptive determinization count (2-8) based on remaining time budget."""
+def determinizations_for(num_candidates, remaining, min_d=2):
+    """Adaptive determinization count based on remaining time budget, with a
+    caller-supplied floor (used to force extra rollouts for high-leverage
+    low-turn "setup" decisions -- see is_setup_turn())."""
     if remaining <= 0:
-        return 1
+        return max(1, min_d)
     per_candidate = remaining / max(num_candidates, 1)
     if per_candidate > 0.15:
-        return 8
-    if per_candidate > 0.08:
-        return 6
-    if per_candidate > 0.04:
-        return 4
-    if per_candidate > 0.015:
-        return 3
-    return 2
+        d = 8
+    elif per_candidate > 0.08:
+        d = 6
+    elif per_candidate > 0.04:
+        d = 4
+    elif per_candidate > 0.015:
+        d = 3
+    else:
+        d = 2
+    return max(d, min_d)
 
 
-def compute_deadline(obs, start):
-    budget = TARGET_TIME
+def is_setup_turn(cur):
+    """Turn 0-SETUP_TURN_CUTOFF decisions (initial active/bench placement and
+    the first couple of real turns) are the highest-leverage decisions in the
+    game: loss diagnosis showed 100% of observed losses ended with us at
+    zero Pokemon in play, and how many Pokemon get benched early is the
+    single biggest lever on that outcome. We deliberately spend a
+    disproportionate share of the (generous) per-game time budget here."""
+    turn = cur.get("turn")
+    return isinstance(turn, int) and turn <= SETUP_TURN_CUTOFF
+
+
+def compute_deadline(obs, start, setup=False):
+    budget = SETUP_TARGET_TIME if setup else TARGET_TIME
+    hard_cap = SETUP_HARD_CAP if setup else HARD_CAP
     overage = obs.get("remainingOverageTime")
     if isinstance(overage, (int, float)):
         if overage < 3:
             budget = 0.1
         elif overage < 8:
-            budget = 0.3
+            budget = 0.3 if not setup else 1.0
         elif overage < 20:
-            budget = 0.6
-    return start + min(budget, HARD_CAP)
+            budget = 0.6 if not setup else 1.5
+    return start + min(budget, hard_cap)
 
 
 def fallback_pick(sel):
@@ -438,10 +521,11 @@ def fallback_pick(sel):
     return list(range(k))
 
 
-def choose_action(ctx, obs, deadline):
+def choose_action(ctx, obs, deadline, min_d=2):
     """Returns (best_action, best_mean_score_or_None). best_action is None
     only when enumerate_candidates() itself returns nothing (never happens
-    in practice; see enumerate_candidates)."""
+    in practice; see enumerate_candidates). ``min_d`` is a floor on
+    determinizations per candidate, raised for setup-phase decisions."""
     cur = obs["current"]
     me = cur["yourIndex"]
     sel = obs["select"]
@@ -459,7 +543,7 @@ def choose_action(ctx, obs, deadline):
         if time.time() > deadline:
             break
         remaining = deadline - time.time()
-        d = determinizations_for(num_cand, remaining)
+        d = determinizations_for(num_cand, remaining, min_d=min_d)
         total = 0.0
         cnt = 0
         for _ in range(d):
