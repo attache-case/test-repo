@@ -1,4 +1,4 @@
-<!-- word count: 1477 words (body, excluding this comment line) -->
+<!-- word count: 1865 words (body, excluding this comment line) -->
 
 # Strategy Report: Determinized Monte-Carlo Search over the Official PTCG Engine
 
@@ -12,12 +12,15 @@ re-implement Pokemon TCG rules; it drives the competition's own game engine
 candidate scores best on average. This makes the agent rules-correct by
 construction and immediately benefits from any future engine update.
 
-**Current measured strength vs the built-in `random` agent: 86.9% winrate
-(565/650) aggregated over three independent 200-250 game batches, alternating
+**Current measured strength vs the built-in `random` agent: 87.1% winrate
+(653/750) aggregated over four independent 100-250 game batches, alternating
 seats, zero invalid/timeout/error statuses, longest observed win streak 37,
 ~1.6-3.2s wallclock per game.** This clears the project's 80% baseline bar
 comfortably but falls short of a "100 straight wins" aspiration; a structured
-loss diagnosis (below) shows why, and what we did and did not fix.
+loss diagnosis (below) shows why, and what we did and did not fix. We also
+built a small offline learning pipeline (self-play, learned priors, weight
+tuning, deck evolution, §7); none of its three candidate changes cleared our
+own promotion bar yet, and we report those honest negative results too.
 
 ## Model Approach (70%)
 
@@ -104,6 +107,43 @@ always by turn 3-15 — i.e. the residual loss rate is now dominated by opening
 -hand variance (see Deck Concept) rather than search or engine bugs, and
 further gains require deck-level fixes more than agent-level ones.
 
+### 7. Learning pipeline (`ptcg_ai/train/`) and its honest results
+
+To let the agent improve from experience rather than only hand-tuning, we
+built four offline stages, each baking its output back into `main.py` as
+plain embedded constants (no runtime file loads, so the submission stays
+self-contained): (1) `selfplay.py` ran 250 games (agent-vs-agent plus
+agent-vs-`random`/`first`), recording 15,653 per-decision records (select
+type/context, option types, chosen action, board features, final outcome);
+(2) `build_priors.py` aggregated these into a `(select_type, context,
+option_type) -> Laplace-smoothed win-rate` table (19 keys with >=8 samples),
+which `main.py` can use as weighted-sampling/candidate-ranking priors,
+falling back to the existing hand-tuned tiers for any unseen key; (3)
+`tune_weights.py` ran one round of coordinate descent over the leaf-heuristic
+weights against a small, time-shrunk gauntlet; (4) `deck_evolve.py` ran a
+rule-validated evolutionary search over deck compositions (mutations checked
+against the empirical rules below via a real `lib.BattleStart` call before
+being scored).
+
+We enforce a strict **promotion rule** before any learned artifact ships:
+`league_check.py` plays the candidate head-to-head against a frozen
+predecessor snapshot (`ptcg_ai/train/frozen/agent_v1.py`, our post-Phase-1/2
+state) at full production time budget, and it must win >55% over >=50 games.
+Results: the **learned priors** scored 54.0% (27/50) — statistically
+indistinguishable from parity, not promoted. The **tuned weights**
+(`W_BOARD_DEV` 0.10->0.18) looked like a big win in the fast tuning gauntlet
+(81.2% vs a 56.2% baseline, both n=16, shrunk time budget) but scored only
+**38.0%** head-to-head at full budget — a clear reversal, and the most
+important lesson from this pass: a cheap, shrunk-time-budget gauntlet is
+**not** a reliable proxy for full-budget strength, so every promotion
+decision must be re-validated at production settings, never trusted from the
+fast loop alone. **Deck evolution** (1 generation, 3 rule-valid mutants)
+found no mutant beating the 60% bar (best 43.8%), consistent with Phase 2.
+All three changes were reverted/left unshipped; `main.py` ships unchanged
+from the validated Phase-1/2 state, with the full pipeline, data, and these
+results kept and documented (`ptcg_ai/train/README.md`) as a working,
+auditable first pass rather than a mature, converged system.
+
 ## Deck Concept (20%)
 
 ### Empirically-discovered deck rules
@@ -160,8 +200,10 @@ systematically instead.
 4. **Residual losses are opening-hand-variance-dominated** (93% still hit the
    zero-Pokemon condition, mostly turn 3-15): the fix is more deck redundancy
    found via search, not more agent cleverness, at this point.
-5. **Learning pipeline** (`ptcg_ai/train/`): self-play data collection,
-   learned action-outcome priors, gauntlet/league eval, and evolutionary deck
-   search are designed and implemented at a small, time-boxed scale (see
-   `ptcg_ai/train/README.md`) rather than run to convergence — the natural
-   next step is scaling each stage up.
+5. **The learning pipeline (§7) needs scale, not redesign**: 250 self-play
+   games and single-round tuning/evolution passes are enough to build and
+   validate the machinery end-to-end (including catching the fast-gauntlet/
+   full-budget discrepancy above) but not enough data to clear our own
+   promotion bar. More self-play games, more coordinate-descent rounds
+   evaluated only at full budget, and more deck-evolution generations are
+   the concrete next steps (`ptcg_ai/train/README.md`, "Scaling up").

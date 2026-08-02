@@ -107,33 +107,6 @@ W_HAND = 0.05
 W_PRESENCE = 0.25
 PRESENCE_CAP = 3  # Pokemon count beyond which extra copies stop adding safety value
 
-# ---------------------------------------------------------------------------
-# Learned action priors (ptcg_ai/train/ pipeline). Keyed by
-# "select_type|select_context|option_type" -> empirical win-rate in [0, 1]
-# with Laplace smoothing, mined from self-play by
-# ptcg_ai/train/build_priors.py (see ptcg_ai/train/README.md to regenerate).
-# Embedded as a plain literal so main.py stays self-contained (no runtime
-# file loads). Empty/missing keys fall back to PRIOR_DEFAULT (neutral) --
-# the tiered heuristics in playout_policy/enumerate_candidates always work
-# even with LEARNED_PRIORS = {}, so this is purely an additive refinement.
-# ---------------------------------------------------------------------------
-PRIOR_DEFAULT = 0.5
-PRIOR_BLEND = 0.6  # weight on the learned prior vs. the 0.5 neutral prior
-# A 19-key table WAS generated 2026-08-02 by ptcg_ai/train/build_priors.py
-# from 250 self-play games (15,653 decisions; see
-# ptcg_ai/train/artifacts/action_priors.json and ptcg_ai/train/README.md to
-# regenerate/inspect it). Per this project's own promotion rule -- a change
-# must beat its immediate predecessor >55% over >=50 games
-# (ptcg_ai/train/league_check.py) before shipping -- that table scored only
-# 54.0% (27/50) head-to-head against the pre-priors frozen snapshot
-# (ptcg_ai/train/frozen/agent_v1.py): statistically indistinguishable from
-# parity at this small self-play scale, not a proven improvement. So it is
-# NOT activated by default here (LEARNED_PRIORS stays empty); the mined
-# table, the pipeline, and this result are kept and documented as a working
-# first pass to scale up (more self-play games) rather than a shipped
-# behavior change. See strategy_report.md "Model Approach" for the numbers.
-LEARNED_PRIORS = {}
-
 _CTX = None  # lazily-created AgentStart() context, reused across decisions
 
 # ---------------------------------------------------------------------------
@@ -147,11 +120,6 @@ _CTX = None  # lazily-created AgentStart() context, reused across decisions
 # ---------------------------------------------------------------------------
 
 DEBUG = os.environ.get("PTCG_DEBUG") == "1"
-# Opt-in, only meaningful with DEBUG on: keep the FULL per-game decision
-# history instead of trimming to the last dozen. Used by
-# ptcg_ai/train/selfplay.py to collect complete per-decision training
-# records; diagnostic tooling (loss dumps) keeps the bounded ring buffer.
-FULL_HISTORY = os.environ.get("PTCG_FULL_HISTORY") == "1"
 _HISTORY_LEN = 12
 
 
@@ -189,7 +157,7 @@ def _debug_note(**entry):
         return
     _STATS["decisions"] += 1
     _STATS["history"].append(entry)
-    if not FULL_HISTORY and len(_STATS["history"]) > _HISTORY_LEN:
+    if len(_STATS["history"]) > _HISTORY_LEN:
         del _STATS["history"][0]
 
 
@@ -342,19 +310,6 @@ def heuristic_eval(obs, me):
     return max(-1.0, min(1.0, score))
 
 
-def _prior_score(sel_type, sel_context, opt_type):
-    """Learned-prior win-rate estimate for picking an option of this shape,
-    blended toward neutral (0.5) by PRIOR_BLEND. Returns PRIOR_DEFAULT
-    whenever LEARNED_PRIORS is empty or the key is unseen -- a pure no-op
-    until ptcg_ai/train/build_priors.py output is embedded."""
-    if not LEARNED_PRIORS:
-        return PRIOR_DEFAULT
-    p = LEARNED_PRIORS.get(f"{sel_type}|{sel_context}|{opt_type}")
-    if p is None:
-        return PRIOR_DEFAULT
-    return PRIOR_BLEND * p + (1 - PRIOR_BLEND) * PRIOR_DEFAULT
-
-
 def playout_policy(sel, hand=None, board_thin=False):
     """Biased-random legal action for playouts. Tiered preference, each tier
     only used when it's non-empty and the pick size k fits it:
@@ -413,10 +368,6 @@ def playout_policy(sel, hand=None, board_thin=False):
     k = min(k, len(pool))
     if k <= 0:
         return []
-    if k == 1 and len(pool) > 1 and LEARNED_PRIORS:
-        sel_type, sel_context = sel.get("type"), sel.get("context")
-        weights = [max(_prior_score(sel_type, sel_context, opts[i].get("type")), 0.01) for i in pool]
-        return [random.choices(pool, weights=weights, k=1)[0]]
     return random.sample(pool, k)
 
 
@@ -533,18 +484,7 @@ def enumerate_candidates(sel):
     if len(cands) > CANDIDATE_CAP:
         head = cands[0]
         rest = cands[1:]
-        if LEARNED_PRIORS:
-            sel_type, sel_context = sel.get("type"), sel.get("context")
-            opts = sel["option"]
-
-            def _cand_prior(c):
-                if len(c) == 1:
-                    return _prior_score(sel_type, sel_context, opts[c[0]].get("type"))
-                return PRIOR_DEFAULT
-
-            rest.sort(key=_cand_prior, reverse=True)
-        else:
-            random.shuffle(rest)
+        random.shuffle(rest)
         cands = [head] + rest[: CANDIDATE_CAP - 1]
 
     return cands
