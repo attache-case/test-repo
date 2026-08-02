@@ -605,7 +605,8 @@ def agent(obs):
             return []
 
         start = time.time()
-        deadline = compute_deadline(obs, start)
+        setup = is_setup_turn(cur)
+        deadline = compute_deadline(obs, start, setup=setup)
         candidates = enumerate_candidates(sel)
         if len(candidates) <= 1:
             action = candidates[0] if candidates else fallback_pick(sel)
@@ -625,8 +626,9 @@ def agent(obs):
 
         ctx = _get_ctx()
         action, best_score = None, None
+        min_d = SETUP_MIN_DETERMINIZATIONS if setup else 2
         try:
-            action, best_score = choose_action(ctx, obs, deadline)
+            action, best_score = choose_action(ctx, obs, deadline, min_d=min_d)
         finally:
             try:
                 lib.SearchEnd(ctx)
