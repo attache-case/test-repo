@@ -496,13 +496,27 @@ def agent(obs):
         sel = obs["select"]
         n = len(sel.get("option") or [])
         cur = obs.get("current") or {}
+        if DEBUG and cur:
+            me_dbg = cur.get("yourIndex")
+            if me_dbg is not None:
+                mp = cur["players"][me_dbg]
+                _debug_board = {
+                    "active_n": len(mp.get("active") or []),
+                    "bench_n": len(mp.get("bench") or []),
+                }
+            else:
+                _debug_board = {}
+        else:
+            _debug_board = {}
         if n == 0:
             if DEBUG:
                 _STATS["fallback_decisions"] += 1
                 _debug_note(
                     turn=cur.get("turn"), me=cur.get("yourIndex"),
-                    sel_type=sel.get("type"), n_options=0, n_candidates=0,
+                    sel_type=sel.get("type"), sel_context=sel.get("context"),
+                    n_options=0, n_candidates=0,
                     action=[], fallback=True, best_score=None, reason="no_options",
+                    **_debug_board,
                 )
             return []
 
@@ -517,8 +531,11 @@ def agent(obs):
                     _STATS["fallback_decisions"] += 1
                 _debug_note(
                     turn=cur.get("turn"), me=cur.get("yourIndex"),
-                    sel_type=sel.get("type"), n_options=n, n_candidates=len(candidates),
+                    sel_type=sel.get("type"), sel_context=sel.get("context"),
+                    option_types=[o.get("type") for o in (sel.get("option") or [])],
+                    n_options=n, n_candidates=len(candidates),
                     action=action, fallback=fb, best_score=None, reason="single_candidate",
+                    **_debug_board,
                 )
             return action
 
@@ -541,10 +558,13 @@ def agent(obs):
                 _STATS["fallback_decisions"] += 1
             _debug_note(
                 turn=cur.get("turn"), me=cur.get("yourIndex"),
-                sel_type=sel.get("type"), n_options=n, n_candidates=len(candidates),
+                sel_type=sel.get("type"), sel_context=sel.get("context"),
+                option_types=[o.get("type") for o in (sel.get("option") or [])],
+                n_options=n, n_candidates=len(candidates),
                 action=action, fallback=used_fallback, best_score=best_score,
                 elapsed=round(time.time() - start, 3),
                 reason=("fallback" if used_fallback else ("no_rollout" if best_score is None else "search")),
+                **_debug_board,
             )
         return action
     except Exception:
