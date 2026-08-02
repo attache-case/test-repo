@@ -232,6 +232,74 @@ def _pool_from_counter(counter, needed, filler=FILLER_CARD_ID):
     return pool[:needed]
 
 
+BASIC_ENERGY_IDS = set(range(1, 9))  # cardIds 1-8: one Basic Energy per type
+# A small set of broadly-common, deck-agnostic staple trainers (Ultra Ball,
+# Boss's Orders, Cheren-style draw, Judge-style hand disruption, Switch) used
+# ONLY to pad the opponent's unseen-card pool -- see _opp_generic_template.
+GENERIC_STAPLE_TRAINER_IDS = [1121, 1182, 1224, 1213, 1123]
+# A few generic Basic Pokemon spread across different types, included ONLY
+# as a legality floor: the engine requires every deck to contain >=1 Basic
+# Pokemon, so before we've observed any of the opponent's board (e.g. turn
+# 0) the template needs *some* Pokemon in it or SearchBegin's determinized
+# opponent "deck" fails validation. This is not a guess at their actual
+# deck -- just enough variety that the simulated opponent can legally have
+# something to play.
+NEUTRAL_BASIC_MON_IDS = [721, 682, 210, 1072]
+
+
+def _infer_opp_energy_id(op):
+    """Infer a plausible Basic Energy id for the opponent's deck from
+    directly-observed evidence (energy actually attached to their Pokemon,
+    or in their discard pile) -- never guessed from our own deck. Falls
+    back to a neutral default (Basic {W} Energy) when nothing's been
+    observed yet (e.g. turn 0)."""
+    seen = Counter()
+    for zone in ("active", "bench"):
+        for mon in op.get(zone) or []:
+            for e in mon.get("energyCards") or []:
+                cid = e.get("id") if isinstance(e, dict) else e
+                if cid in BASIC_ENERGY_IDS:
+                    seen[cid] += 1
+    for c in op.get("discard") or []:
+        cid = c.get("id") if isinstance(c, dict) else c
+        if cid in BASIC_ENERGY_IDS:
+            seen[cid] += 1
+    if seen:
+        return seen.most_common(1)[0][0]
+    return FILLER_CARD_ID
+
+
+def _opp_generic_template(op):
+    """Deck-agnostic Counter template for the opponent's unseen cards.
+
+    IMPORTANT: this must NEVER assume the opponent is playing our own
+    ``DECK`` -- with multiple archetypes in play (see
+    ptcg_ai/train/artifacts/archetype_tournament.md) that assumption is
+    actively wrong, not just an approximation. Built purely from evidence
+    plus generic, deck-agnostic priors: (a) cardIds we've actually observed
+    of theirs, assumed to have ~2 more hidden copies (real decks commonly
+    run multiples of a card they've already shown); (b) a small set of
+    broadly-common staple trainers; (c) a handful of generic Basic Pokemon
+    across different types (a legality floor -- an all-trainer/energy
+    template would violate the engine's ">=1 Basic Pokemon per deck" rule
+    before we've observed any of their board); (d) heavy weighting on Basic
+    Energy of whichever type we've directly observed them using (or a
+    neutral default if nothing's been observed). ``_pool_from_counter`` pads
+    any shortfall with more filler energy, so this template never needs to
+    sum to exactly the required count.
+    """
+    template = Counter()
+    for cid in NEUTRAL_BASIC_MON_IDS:
+        template[cid] += 3
+    for cid in visible_ids(op):
+        if cid not in BASIC_ENERGY_IDS:
+            template[cid] += 2
+    for cid in GENERIC_STAPLE_TRAINER_IDS:
+        template[cid] += 4
+    template[_infer_opp_energy_id(op)] += 40
+    return template
+
+
 def determinize(cur):
     """Build one random determinization of both players' hidden zones.
 
@@ -239,10 +307,11 @@ def determinize(cur):
     deck (``DECK``) minus everything currently visible of mine -- exact by
     construction since we always submit ``DECK`` as our real deck.
 
-    Opponent hidden zones (deck + face-down prizes + hand): the true opponent
-    deck is unknown on Kaggle, so we fall back to a "mirror of our own deck"
-    filler pool with any opponent cards we HAVE seen removed from it first.
-    This is a placeholder policy; see report for future work (deck inference).
+    Opponent hidden zones (deck + face-down prizes + hand): the true
+    opponent deck is unknown on Kaggle (and, in local tournaments, may be a
+    completely different archetype from ours), so we build a deck-agnostic
+    generic template (``_opp_generic_template``) from observed evidence
+    instead of assuming they mirror our own deck.
     """
     me = cur["yourIndex"]
     my = cur["players"][me]
@@ -258,10 +327,7 @@ def determinize(cur):
     my_deck_cards = my_pool[:my_needed_deck]
     my_prize_cards = my_pool[my_needed_deck:my_needed_deck + my_needed_prize]
 
-    opp_template = Counter(DECK)
-    for cid in visible_ids(op):
-        if opp_template[cid] > 0:
-            opp_template[cid] -= 1
+    opp_template = _opp_generic_template(op)
     opp_needed_deck = op["deckCount"]
     opp_needed_prize = sum(1 for x in op["prize"] if x is None)
     opp_needed_hand = op["handCount"]
