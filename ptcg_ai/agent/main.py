@@ -1,8 +1,35 @@
 """Kaggle submission agent for "The Pokemon Company - PTCG AI Battle Challenge"
 (Simulation category baseline).
 
-Self-contained: only the Python standard library and ``kaggle_environments`` are
-used. No files are read at runtime and no heavy work happens at import time.
+Self-contained: only the Python standard library and the engine's compiled
+``lib`` (loaded below) are used (no ``ptcg_ai`` package-relative imports --
+this file is dropped flat into /kaggle_simulations/agent/ with no package
+around it). No heavy work happens at import time. The one runtime file
+access is optional and defensive: on the first call we look for
+``deck.csv`` next to this file (the Kaggle submission bundle convention)
+and use it if present and valid, else fall back to the embedded ``DECK``
+constant -- see the comment above ``DECK`` for why and
+``ptcg_ai/submission/`` for the bundle-building tooling.
+
+Engine import -- dual use, see ptcg_ai/submission/build_submission.sh and
+README.md "Submission packaging": the OFFICIAL sample submission bundles a
+full ``cg/`` folder (compiled binaries + Python wrapper) as a SIBLING of
+main.py and imports it as a plain top-level package (``from cg.api import
+...``), rather than relying on anything from a pip-installed
+``kaggle_environments`` being importable inside the agent's own runtime --
+that's deliberate: the harness process that referees the match is not
+guaranteed to be the same process/environment your submitted agent code
+runs in, so the agent must carry its own copy of the engine. We follow that
+same convention below (try the bundled ``cg`` package first) but keep a
+fallback to the pip-installed ``kaggle_environments.envs.cabt.cg`` copy so
+this exact file also runs unmodified against the local dev venv (pytest,
+smoke_test.py, run_eval.py, etc., none of which have a ``cg/`` folder
+sitting next to ptcg_ai/agent/main.py). We use the engine's raw ``lib``
+ctypes handle either way (not the official ``cg.api`` dataclass wrapper --
+see the "Search API bindings" comment below for why: our own thin
+raw-dict/ctypes bindings, cross-verified against ``cg/api.py``, are
+lighter-weight for a tight rollout loop that calls SearchStep tens of
+thousands of times per game).
 
 Strategy in one line: determinized Monte Carlo search (PIMC) that drives the
 official game engine's own ``Search*`` API to roll out candidate actions to a
@@ -22,7 +49,23 @@ import random
 import time
 from collections import Counter
 
-from kaggle_environments.envs.cabt.cg.sim import lib
+# NOTE: deliberately no ``__file__`` anywhere in this module (see
+# _resolve_submission_deck below for the full explanation): kaggle-
+# environments' real agent loader (kaggle_environments/agent.py,
+# get_last_callable) compiles+execs a submitted file's source text into a
+# fresh namespace WITHOUT binding ``__file__`` -- only ``sys.path`` gets the
+# file's directory appended for the duration of that exec call. So a plain
+# ``from cg.sim import lib`` already resolves correctly against a bundled
+# sibling ``cg/`` package with no manual sys.path work needed (and manual
+# sys.path work that reads ``__file__`` would crash at import time). This
+# was verified directly: python3 -m py_compile fails silently but
+# ``kaggle_environments.make("cabt").run([path, path])`` raised
+# ``NameError: name '__file__' is not defined`` the first time this file
+# had a module-level ``__file__`` reference; removing it fixed the preflight.
+try:
+    from cg.sim import lib  # Kaggle submission bundle: cg/ is a sibling of this file
+except ImportError:
+    from kaggle_environments.envs.cabt.cg.sim import lib  # local dev/eval venv fallback
 
 # ---------------------------------------------------------------------------
 # Search API bindings (verified signatures -- see ptcg_ai/report/strategy_report.md)
@@ -39,12 +82,16 @@ lib.SearchBegin.argtypes = (
 lib.SearchStep.restype = ctypes.c_char_p
 lib.SearchStep.argtypes = [
     ctypes.c_void_p,
-    ctypes.c_long,
+    ctypes.c_int64,  # search_id -- c_int64 confirmed against the official
+                      # cg/sim.py (byte-identical libcg.so exports this
+                      # signature); c_long happens to alias c_int64 on
+                      # 64-bit Linux so this was not observably wrong on
+                      # Kaggle's runtime, but is fixed here for exactness.
     ctypes.POINTER(ctypes.c_int),
     ctypes.c_int,
 ]
 lib.SearchEnd.argtypes = [ctypes.c_void_p]
-lib.SearchRelease.argtypes = [ctypes.c_void_p, ctypes.c_long]
+lib.SearchRelease.argtypes = [ctypes.c_void_p, ctypes.c_int64]
 
 # ---------------------------------------------------------------------------
 # Deck constant. CLEARLY MARKED SWAP POINT: replace this list with a tuned
@@ -80,12 +127,80 @@ DECK = [
 ]
 assert len(DECK) == 60
 
+# ---------------------------------------------------------------------------
+# deck.csv (Kaggle submission bundle convention). VERIFIED (see
+# strategy_report.md / README.md "Kaggle submission" section): the official
+# "How to Submit" instructions mention a deck.csv alongside main.py in the
+# .tar.gz bundle, but the actual game engine (kaggle_environments' cabt
+# package -- grepped exhaustively across every .py file in both 1.32.2 and
+# 1.32.3, byte-identical, plus the generic agent/core-loading code) has NO
+# csv-reading logic anywhere. cabt was only added to kaggle_environments on
+# 2025-08-18, so the "kaggle-environments 1.14.10" version named on the
+# submission page cannot be the actual pinned runtime (no 1.14.x release
+# contains cabt at all) -- that text is stale/boilerplate, not a real
+# constraint to satisfy. The engine's ONLY deck-input mechanism is this
+# agent's own return value on the first call (obs["select"] is None).
+# deck.csv is therefore purely a bundle-directory convention for a human (or
+# some Kaggle-side display/validation layer we can't inspect) to read the
+# decklist without opening main.py -- not something the simulation consumes
+# directly. We read it defensively anyway, in case Kaggle's harness DOES do
+# something with it: if present next to this file and it parses to exactly
+# 60 positive integers (one per line, or comma-separated -- see
+# _resolve_submission_deck), we submit ITS content; otherwise we fall back
+# to the embedded DECK above. ptcg_ai/submission/deck.csv is the committed
+# source-of-truth copy and must always match DECK exactly (built/checked by
+# ptcg_ai/submission/build_submission.sh).
+# ---------------------------------------------------------------------------
+_ACTIVE_DECK = None  # set on first agent() call to whichever deck we actually submitted
+
+
+def _resolve_submission_deck():
+    """Return the 60-card deck to submit: deck.csv if present and valid,
+    else the embedded DECK constant. Never raises.
+
+    Deliberately does NOT use ``__file__`` to locate deck.csv (unlike an
+    earlier version of this function): kaggle-environments' real agent
+    loader execs a submitted file's source into a fresh namespace without
+    ever binding ``__file__`` (see the comment by the ``cg.sim`` import
+    above), so any ``__file__`` reference anywhere in this module crashes
+    the whole agent at import time -- confirmed directly, see the import
+    comment above and the preflight validation notes in README.md. Instead
+    this mirrors the OFFICIAL sample_submission's own ``read_deck_csv()``
+    lookup order exactly: try ``deck.csv`` relative to the current working
+    directory first, then the documented absolute submission path. Unlike
+    the official version (which has no error handling and will crash on a
+    missing/malformed file), this stays defensive and falls back to the
+    embedded DECK constant on any failure.
+    """
+    for path in ("deck.csv", "/kaggle_simulations/agent/deck.csv"):
+        try:
+            with open(path, "r") as f:
+                text = f.read()
+            tokens = [tok.strip() for tok in text.replace(",", "\n").splitlines()]
+            ids = [int(tok) for tok in tokens if tok]
+            if len(ids) == 60 and all(i > 0 for i in ids):
+                return ids
+        except Exception:
+            continue
+    return list(DECK)
+
 # Basic Pokemon card ids in DECK (bench targets) and "search my deck for a
 # Pokemon" trainer ids (Ultra Ball) -- used by playout_policy's board-safety
 # rescue bias and bench_basic_override below. Kept alongside DECK as a
 # matching swap point: update both together if DECK changes.
 BASIC_POKEMON_IDS = {721, 722, 209}
 SEARCH_TRAINER_IDS = {1121}
+
+# AreaType values for "my own Active or Bench spot" (official cg/api.py:
+# AreaType.ACTIVE=4, AreaType.BENCH=5), used wherever we match an option's
+# ``inPlayArea`` field to detect "plays into my own board". Fixed here from
+# a prior version that checked only ``== 4``: that silently matched *only*
+# the empty-Active-spot case and missed the equally common "Active already
+# occupied, this Basic goes to the Bench" case (inPlayArea==5) -- e.g. when
+# we have exactly one Pokemon in play (in Active) and hand holds a second
+# Basic, the only legal spot for it is the Bench, so the old filter would
+# never fire for that specific (and common) rescue scenario.
+ONBOARD_INPLAY_AREAS = (4, 5)
 
 # ---------------------------------------------------------------------------
 # Archetype tournament (ptcg_ai/train/artifacts/archetype_tournament.md):
@@ -364,7 +479,7 @@ def determinize(cur):
     my = cur["players"][me]
     op = cur["players"][1 - me]
 
-    my_template = Counter(DECK)
+    my_template = Counter(_ACTIVE_DECK if _ACTIVE_DECK is not None else DECK)
     for cid in visible_ids(my):
         if my_template[cid] > 0:
             my_template[cid] -= 1
@@ -391,12 +506,46 @@ def determinize(cur):
     return my_deck_cards, my_prize_cards, opp_deck_cards, opp_prize_cards, opp_hand_cards
 
 
+def _guess_opponent_active_id(op):
+    """Guess a plausible Pokemon card id for SearchBegin's 6th array arg
+    (``opponent_active``), which the official cg/api.py confirms is REQUIRED
+    -- and raises ValueError without it -- whenever the opponent's Active
+    Pokemon is face-down (``players[i].active == [None]`` per the official
+    PlayerState/Pokemon dataclasses; our raw JSON uses the same ``None``
+    convention). We previously always passed an empty array here, which is
+    only valid when the opponent's active is either absent or face-up.
+
+    Prefers a Pokemon id actually observed of theirs (e.g. still visible on
+    their bench) since that's evidence of what's in their deck; falls back
+    to a generic neutral Basic id otherwise. The exact guess only seeds our
+    own simulated opponent for rollouts -- it has no effect on the real
+    hidden game state -- so any legal Basic/evolution id is safe, precision
+    just improves rollout realism."""
+    seen = Counter()
+    for mon in op.get("bench") or []:
+        cid = mon.get("id") if isinstance(mon, dict) else mon
+        if cid:
+            seen[cid] += 1
+    if seen:
+        return seen.most_common(1)[0][0]
+    return NEUTRAL_BASIC_MON_IDS[0]
+
+
 def search_begin(ctx, obs):
     cur = obs["current"]
+    me = cur["yourIndex"]
+    op = cur["players"][1 - me]
     my_deck, my_prize, opp_deck, opp_prize, opp_hand = determinize(cur)
     sbi = obs["search_begin_input"]
     if isinstance(sbi, str):
         sbi = sbi.encode("ascii")
+    opp_active_zone = op.get("active") or []
+    if len(opp_active_zone) == 1 and opp_active_zone[0] is None:
+        # Face-down opponent Active: opponent_active is required (raises
+        # otherwise per the official search_begin contract).
+        opponent_active = [_guess_opponent_active_id(op)]
+    else:
+        opponent_active = []
     r = lib.SearchBegin(
         ctx,
         sbi,
@@ -406,7 +555,7 @@ def search_begin(ctx, obs):
         arr(opp_deck),
         arr(opp_prize),
         arr(opp_hand),
-        arr([]),
+        arr(opponent_active),
         0,
     )
     return json.loads(r.decode())
@@ -486,9 +635,10 @@ def playout_policy(sel, hand=None, board_thin=False):
          thinned to <=1 Pokemon; getting a spare into play/hand ASAP is the
          single highest-value action available in that situation.
       1. attacks (option type 13) -- push the game toward a decision/win.
-      2. "play to board" options (type 8 targeting inPlayArea 4, i.e. bench)
-         -- covers both benching a new Pokemon and attaching energy to a
-         benched one; both develop the board.
+      2. "play to board" options (type 8 targeting my own Active or Bench,
+         inPlayArea in {4, 5} per the official AreaType enum) -- covers
+         attaching energy/tools to either an active or benched Pokemon,
+         which develops the board.
       3. any other non-pass (type != 14) option.
       4. pass (type 14), only if nothing else fits.
     """
@@ -504,7 +654,10 @@ def playout_policy(sel, hand=None, board_thin=False):
     opts = sel["option"]
     non_pass = [i for i in idxs if opts[i].get("type") != 14]
     attacks = [i for i in non_pass if opts[i].get("type") == 13]
-    board_dev = [i for i in non_pass if opts[i].get("type") == 8 and opts[i].get("inPlayArea") == 4]
+    board_dev = [
+        i for i in non_pass
+        if opts[i].get("type") == 8 and opts[i].get("inPlayArea") in ONBOARD_INPLAY_AREAS
+    ]
 
     pool = None
     if board_thin and hand:
@@ -555,13 +708,23 @@ def rollout_score(ctx, obs, first_action, me, deadline):
 
 
 def _rollout_score_impl(ctx, obs, first_action, me, deadline):
+    """Note on search_id: the official cg/api.py contract is that SearchStep's
+    search_id argument must be the authoritative ``searchId`` field echoed
+    back in the prior response's ``state`` (``SearchState.searchId``), not a
+    value the caller invents. We read it from ``state["searchId"]`` on every
+    step below rather than hand-incrementing a local counter -- on a single
+    linear chain of steps within one rollout (which is what happens here:
+    begin, then one SearchStep per decision until terminal/depth-cap) a
+    same-session incrementing counter starting at 0 might happen to coincide
+    with the engine's own ids, but that's an unverified assumption this
+    removes entirely by always trusting the response."""
     try:
         j = search_begin(ctx, obs)
         if not j.get("state"):
             if DEBUG and _STATS is not None:
                 _STATS["search_begin_fail"] += 1
             return None
-        handle = 0
+        handle = j["state"]["searchId"]
         out = json.loads(
             lib.SearchStep(ctx, handle, arr(first_action), len(first_action)).decode()
         )
@@ -569,8 +732,8 @@ def _rollout_score_impl(ctx, obs, first_action, me, deadline):
             if DEBUG and _STATS is not None:
                 _STATS["search_step_fail"] += 1
             return None
-        handle += 1
         st = out["state"]
+        handle = st["searchId"]
         steps = 0
         while True:
             o = st["observation"]
@@ -599,7 +762,7 @@ def _rollout_score_impl(ctx, obs, first_action, me, deadline):
                 )
                 if out.get("state"):
                     st = out["state"]
-                    handle += 1
+                    handle = st["searchId"]
                     success = True
                     break
                 elif DEBUG and _STATS is not None:
@@ -757,16 +920,17 @@ def _hand_play_option_ids(hand, opts):
 
 
 def _benchable_basic_idxs(hand, opts):
-    """Option indices that would play a Basic Pokemon from hand to the bench
-    (same shape-based match as bench_basic_override). Used both by the
-    override itself and by debug instrumentation, so loss classification can
-    tell whether such an opportunity existed on a given decision regardless
-    of whether presence was already <=1 at the time."""
+    """Option indices that would play a Basic Pokemon from hand into an
+    empty Active spot or onto the Bench (same shape-based match as
+    bench_basic_override). Used both by the override itself and by debug
+    instrumentation, so loss classification can tell whether such an
+    opportunity existed on a given decision regardless of whether presence
+    was already <=1 at the time."""
     if not hand:
         return []
     idxs = []
     for i, o in enumerate(opts):
-        if o.get("area") == 2 and o.get("inPlayArea") == 4:
+        if o.get("area") == 2 and o.get("inPlayArea") in ONBOARD_INPLAY_AREAS:
             hidx = o.get("index")
             if hidx is not None and 0 <= hidx < len(hand):
                 cid = hand[hidx].get("id")
@@ -787,12 +951,18 @@ def bench_basic_override(cur, sel):
     list) or None if the condition doesn't hold (fall through to normal
     search/fallback).
 
-    Matches on shape (area==2 "from hand", inPlayArea==4 "to bench", and the
-    underlying hand card being a known Basic Pokemon id) rather than a
-    specific option "type" code, because the engine uses different type
-    codes for this play depending on context (e.g. type 3 during initial
-    setup vs type 8 during a normal turn's action menu) -- gating on the
-    card identity instead of the type code is robust to both.
+    Matches on shape (area==2 "from hand", inPlayArea in {4, 5} i.e. my own
+    Active or Bench per the official AreaType enum, and the underlying hand
+    card being a known Basic Pokemon id) rather than a specific option
+    "type" code, because the engine uses different type codes for this play
+    depending on context (e.g. type 3 during initial setup vs type 8 during
+    a normal turn's action menu) -- gating on the card identity instead of
+    the type code is robust to both. inPlayArea must cover BOTH zones: an
+    empty board offers inPlayArea==4 (into Active), while a lone Pokemon
+    already in Active offers inPlayArea==5 for the second Basic (onto
+    Bench) -- checking only ==4 (an earlier version's bug, caught by
+    cross-referencing the official cg/api.py AreaType enum) silently missed
+    that second, equally common case.
     """
     me = cur.get("yourIndex")
     if me is None:
@@ -815,7 +985,7 @@ def bench_basic_override(cur, sel):
         return None  # only override plain single-pick selects, never a forced multi-select
     opts = sel.get("option") or []
     for i, o in enumerate(opts):
-        if o.get("area") == 2 and o.get("inPlayArea") == 4:
+        if o.get("area") == 2 and o.get("inPlayArea") in ONBOARD_INPLAY_AREAS:
             hidx = o.get("index")
             if hidx is not None and 0 <= hidx < len(hand):
                 cid = hand[hidx].get("id")
@@ -878,7 +1048,9 @@ def agent(obs):
     call)."""
     try:
         if obs.get("select") is None:
-            return list(DECK)
+            global _ACTIVE_DECK
+            _ACTIVE_DECK = _resolve_submission_deck()
+            return list(_ACTIVE_DECK)
 
         sel = obs["select"]
         n = len(sel.get("option") or [])

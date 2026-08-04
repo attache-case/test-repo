@@ -1,3 +1,11 @@
 *.pyc
 __pycache__/
 ptcg_ai/train/data/*.jsonl
+
+# Submission build staging: contains a copy of the official engine's cg/
+# folder (compiled binaries + Python wrapper), which is license-restricted
+# (LicenseRef-PTCG-ABC-Competition-Use-Only, competition-use-only, no
+# redistribution) and copied in only at build time by
+# ptcg_ai/submission/build_submission.sh -- never to be committed.
+ptcg_ai/submission/.build/
+ptcg_ai/submission/submission.tar.gz

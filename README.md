@@ -43,7 +43,12 @@ Kaggle コンペティション「The Pokémon Company - PTCG AI Battle Challeng
     │   └── main.py                    # Kaggle 提出用エージェント本体
     ├── eval/
     │   ├── run_eval.py                # N 戦の対戦評価スクリプト
-    │   └── smoke_test.py              # 1 戦だけの疎通確認スクリプト
+    │   ├── smoke_test.py              # 1 戦だけの疎通確認スクリプト
+    │   └── classify_losses.py         # RESULT.reason による厳密な敗因分類
+    ├── submission/                    # Kaggle 提出パッケージのビルドツール
+    │   ├── build_submission.sh         # submission.tar.gz のビルド・検証
+    │   ├── generate_deck_csv.py        # main.py の DECK から deck.csv を再生成
+    │   └── deck.csv                    # コミット対象の deck.csv（自動生成・DECKと同期）
     ├── train/                         # オフライン学習パイプライン（下記参照）
     │   ├── selfplay.py                 # 自己対戦データ収集
     │   ├── build_priors.py             # 学習済み行動事前分布の構築
@@ -113,6 +118,12 @@ pip install kaggle-environments
 すが、統計的な外れ値であることを再現性確認（5回目、90.0%）で確認済みです
 （詳細は下記「なぜ100連勝が現実的な目標ではないか」を参照）。
 
+上記の1350戦は下記「公式データによるクロスバリデーション」の修正**前**の
+数値です。修正後、同一条件（40戦、対 `random`）で再検証したところ
+**77.5% → 90.0%** に改善しました（`inPlayArea` の解釈ミス修正が主因、
+詳細は同セクション参照）。大規模な再検証（1000戦超）は今後の作業として
+残っています。
+
 ### 決定論的セーフティ・オーバーライドと精密な敗因分類
 
 `main.py` に環境変数 `PTCG_DEBUG=1` でのみ有効になる軽量な計測フックを追加
@@ -167,11 +178,114 @@ pip install kaggle-environments
 目標です。上記の敗因分類が示す通り、残る敗北はいずれも「防げなかった」ことが
 証明されるものであり、100%の主張ではなくこの分析自体を報告します。
 
+## 公式データによるクロスバリデーション
+
+コンペティション公式の C++ エンジンソース・公式 `sample_submission`（`main.py` /
+`deck.csv` / `cg/` フォルダ一式）・日本語カードデータベースを入手し、これまでの
+（リバースエンジニアリングに基づく）実装を全面的に監査しました。ライセンス
+（`LicenseRef-PTCG-ABC-Competition-Use-Only`、コンペ用途限定・再配布禁止）に
+従い、これら公式データそのものは本リポジトリに一切コミットしていません
+（`.gitignore` で明示的に除外、`git status`/`git log --stat` で毎回確認）。
+
+**見つかった実バグと修正:**
+
+1. **`inPlayArea` の解釈ミス（最も影響が大きい）**: 公式 `cg/api.py` の
+   `AreaType` 列挙 (`ACTIVE=4, BENCH=5`) と照合した結果、
+   `bench_basic_override()` とプレイアウトの救済バイアスが
+   `inPlayArea==4` のみでマッチしており、「場が空でたねポケモンを
+   バトル場に出す」ケースしか拾えず、「バトル場に1匹いてベンチに
+   2体目を出す」という同じくらい重要なケースを見逃していました。
+   `{4, 5}` 両方にマッチするよう修正し、同一の40戦ベンチマークで
+   **勝率 77.5% → 90.0%** に改善（探索呼び出しの失敗件数はどちらも0件
+   — クラッシュしないサイレントなバグだったため、公式ソースとの
+   照合でしか発見できませんでした）。
+2. **`SearchBegin` 第6引数（`opponent_active`）**: 相手のバトル場が
+   裏向きのとき必須（省略すると本来エラー）にもかかわらず常に空配列を
+   渡していました。観測済みの相手カードから妥当な ID を推測して渡すよう修正。
+3. **`SearchStep` の `search_id`**: 前回レスポンスの権威ある `searchId`
+   フィールドを読むのが正しい契約なのに、0から自前でインクリメントする
+   カウンタに依存していました。常にレスポンスの `searchId` を使うよう修正。
+4. **ハンドル型**: `ctypes.c_long` → `c_int64`（64bit Linux では同一だが、
+   公式シグネチャに厳密に合わせて修正）。
+5. **敗因の再分類**: これまで盤面状態から推測していた敗因を、公式
+   `LogType.RESULT.reason`（1=相手が6枚取得、2=デッキアウト、
+   3=バトル場に自分のポケモンがいない、4=カード効果）という一次情報で
+   再検証（`ptcg_ai/eval/classify_losses.py`）。60戦の敗北8件は
+   reason=3 が75%（従来の盤面推測と一致）、**reason=1（プライズレース負け）
+   が25%**という、従来の粗い推測では区別されていなかった副次的な敗因
+   モードが判明。デッキアウト・カード効果による敗北は0件でした。
+6. **カードプールカタログの補強**: 日本語カードデータベースとの ID
+   突き合わせで v3 の全カードの名称・タイプ整合性を確認し、これまで
+   `card_pool_catalog.md` に未掲載だった Snover / Mega Abomasnow ex
+   （id 722 / 723、v3 の進化ラインの一部）のエントリを、エンジン自身の
+   `AllCard`/`AllAttack` データから追記しました（ライセンス上、日本語
+   データベースの内容そのものは要約・突き合わせ目的のみに使用し、
+   行の転載はしていません）。
+
+詳細と数値は `ptcg_ai/report/strategy_report.md` §2・§6 を参照してください。
+
 ## Kaggle への提出方法
 
-- **Simulation カテゴリ**: `ptcg_ai/agent/main.py` をそのまま提出します。
-  標準ライブラリと `kaggle_environments` のみに依存する単一ファイルで、
-  実行時に外部ファイルを一切読み込みません。
+**提出パッケージの正しい形式（公式 `sample_submission` で確認・訂正済み）**:
+Kaggle の "How to Submit" 画面の文言だけからは「`main.py` を単体で
+`tar -czvf submission.tar.gz *` すればよい」ように読めますが、これは
+不正確です。公式 `sample_submission` を実際に展開すると、トップレベルに
+`main.py` と `deck.csv` に加えて、コンパイル済みバイナリと Python
+ラッパー一式を含む `cg/` フォルダが**丸ごと**同梱されています
+（"main.py がネストされていないこと" という制約は main.py 自身についての
+話であり、`cg/` サブフォルダの同梱を妨げません）。エンジンはランタイム側が
+提供してくれるという当初の想定は誤りでした。
+
+- **Simulation カテゴリ**: `ptcg_ai/submission/build_submission.sh` を実行して
+  ビルドした `ptcg_ai/submission/submission.tar.gz` を提出します
+  （`main.py` 単体ではありません）。手順:
+  1. 公式データセットを展開したディレクトリを環境変数 `PTCG_OFFICIAL_DATA_DIR`
+     に設定（未設定時はこのプロジェクトの検証時のパスがデフォルトになります
+     — 別環境では必ず自分で設定してください）。
+  2. `bash ptcg_ai/submission/build_submission.sh` を実行。内部で
+     (a) `ptcg_ai/agent/main.py` の `DECK` 定数から `ptcg_ai/submission/deck.csv`
+     を再生成（ドリフト防止、AST 解析のみで `main.py` を import しない）、
+     (b) `main.py` + `deck.csv` + 公式 `cg/`（バイナリ含む、ビルド時のみ
+     ローカルパスからコピー、**コミットはしない** — `.gitignore` 済み）を
+     `ptcg_ai/submission/.build/` にステージング、(c) 「`agent` が最後の
+     トップレベル関数か」「`ptcg_ai` 相対 import が無いか」を静的検査、
+     (d) `tar -czvf submission.tar.gz *` でフラットな tar を作成し
+     `tar -tzf` で構造を検証、(e) サイズ上限 197.7 MiB 未満を確認。
+  3. セルフ対戦プリフライトで検証:
+     `kaggle_environments.make("cabt", debug=True).run([path, path])` を
+     ステージング済み `main.py` のパスに対して実行し、`DONE`/`DONE` で
+     終了することを確認します。
+- **`main.py` のエンジン import の設計判断**: `main.py` は
+  `try: from cg.sim import lib / except ImportError: from
+  kaggle_environments.envs.cabt.cg.sim import lib` という二段構えにして
+  あります。理由は、公式 `sample_submission/main.py` が
+  `from cg.api import ...` と、ローカルにバンドルされた `cg/` を
+  素朴な最上位パッケージとして import している点を踏襲するためです —
+  kaggle-environments のエージェント実行機構
+  (`kaggle_environments/agent.py` の `get_last_callable`) は提出コードを
+  「そのファイルのディレクトリを `sys.path` に追加してから `exec()`
+  する」方式で読み込むため、pip でインストールされた `kaggle_environments`
+  パッケージ内部が同じプロセス内で必ず import 可能とは限りません
+  （むしろ公式サンプルがバンドル方式を採るのはこれが理由と考えられます）。
+  一方でこのリポジトリでのローカル開発・評価（`smoke_test.py`,
+  `run_eval.py` 等）では `cg/` フォルダが `main.py` の隣に存在しないため、
+  pip 版へのフォールバックで動作させています。公式の `cg.api`
+  データクラスラッパーではなく独自の raw dict/ctypes 実装を使い続けている
+  のは、1ゲームで `SearchStep` を数万回呼ぶロールアウトループにおいて
+  軽量な方が有利だからです。
+- **重要な落とし穴（実際に踏んだ）**: `get_last_callable` は提出コードの
+  ソースを新しい名前空間へ `exec()` するだけで、**`__file__` を一切
+  バインドしません**（`sys.path` に実行元ディレクトリを追加するのみ）。
+  そのため `main.py` 内で `__file__` を参照するコード（`deck.csv` の
+  パス解決に使っていました）は、ローカルの `smoke_test.py` では正常でも
+  実際の `kaggle_environments.make(...).run([path, path])` プリフライトで
+  `NameError: name '__file__' is not defined` を起こして**エージェントが
+  即座にクラッシュ**します。修正: `__file__` を一切使わず、公式サンプルと
+  同じ「カレントディレクトリ相対の `deck.csv` → 見つからなければ
+  `/kaggle_simulations/agent/deck.csv`」という探索順に統一（見つからない
+  場合は埋め込み `DECK` 定数へフォールバックする点は公式サンプルより
+  堅牢にしてあります）。この不具合は実際に上記のプリフライトで検出・修正
+  したものです — 修正前は提出そのものが100%失敗していたはずです。
 - **Strategy カテゴリ**: `ptcg_ai/report/strategy_report.md`
   （英語、2000 語以内）を提出します。モデルのアプローチ（探索アルゴリズム、
   determinization、候補手列挙、プレイアウト方策、リーフ評価、時間管理、

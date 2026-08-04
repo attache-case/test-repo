@@ -517,3 +517,31 @@ Full 3-card evolution lines topping out at Stage 2, for archetypes willing to pa
 - **Waitress** (id 1235): Look at the top 6 cards of your deck and attach a Basic Energy card you find there to 1 of your Pokémon. Shuffle the other cards back into your deck.
 - **Tarragon** (id 1238): Put up to 4 in any combination of {F} Pokémon and Basic {F} Energy cards from your discard pile into your hand.
 
+## v3 champion deck: the two cards missing above, plus a cross-check
+
+`ptcg_ai/agent/main.py`'s `DECK` (v3, current champion) runs a Snover/Mega
+Abomasnow ex evolution line that wasn't previously in this catalog (the
+curated lists above are subsets, not exhaustive). Filled in here from the
+engine's own `lib.AllCard()`/`lib.AllAttack()` data (same source as the rest
+of this file):
+
+- **Snover** (id 722, Water, 90HP, Stage: Basic, retreat 3): Beat (10dmg/1en); Icy Snow (30dmg/2en). Evolves into Mega Abomasnow ex.
+- **Mega Abomasnow ex** [megaEx] (id 723, Water, 350HP, retreat 4, evolves from Snover): Hammer-lanche (0dmg/2en) -- discard the top 6 cards of your deck, 100 damage per Basic {W} Energy discarded this way (variance-heavy, big-swing attack); Frost Barrier (200dmg/3en) -- this Pokemon takes 30 less damage from attacks during your opponent's next turn (a defensive follow-up after tagging in).
+
+Separately, as a credibility/consistency check (not a content source -- the
+Japanese card database is competition-licensed, use-only, and not
+redistributed here per `LicenseRef-PTCG-ABC-Competition-Use-Only`): cross-
+referencing DECK's card ids against it confirms every id in v3 maps to its
+expected real-world Pokemon/card name and type, e.g. 209 = Chien-Pao
+(Water), 721 = Kyogre (Water), 722/723 = Snover/Mega Abomasnow (Water),
+1092 = a "Secret Box"-style search Item, 1121 = an Ultra-Ball-style search
+Item, 1163 = an end-of-turn Energy-recovery Tool, 1219 = a Trainer-search
+Supporter, 1227 = Lillie's Determination (shuffle-hand-and-draw-6/8), 1262
+= a Water-type retreat-swap Stadium. This is consistent with the rest of
+this catalog's finding that the card pool uses real Pokemon names/likeness
+with invented, game-balanced mechanics and numbers rather than verbatim
+real-TCG text -- so the Japanese source was used only to validate id<->name
+alignment, not as a source of in-game mechanical text (which, where it
+differs, is the engine's own `AllCard`/`AllAttack` values quoted above and
+throughout this file).
+
