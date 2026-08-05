@@ -79,6 +79,36 @@ Phase-1/2 snapshot (commit `9e4a962`) frozen as the first league baseline;
 never delete frozen snapshots -- add `agent_v2.py`, `agent_v3.py`, etc. as
 the baseline advances.
 
+## Re-validation after the official-source bugfix round (commit `004c94e`)
+
+The `inPlayArea` bugfix (bench_basic_override/rescue bias silently missing
+the "Active occupied, second Basic goes to Bench" case) meant every
+promotion decision made *before* that fix used a weaker version of the
+agent on one side of every comparison, including this project's own
+promotion history. Re-ran the rejected candidates against a fresh frozen
+baseline (`ptcg_ai/train/frozen/agent_v2.py`, the fixed agent, pre-weight-
+retuning) rather than assuming the old verdicts still held:
+
+- **Learned priors**: 48.0% over 50 games vs `agent_v2.py` -- still **not
+  promoted** (same conclusion as before the bugfix, still parity).
+- **Tuned weights**: a fresh `tune_weights.py` pass found a new candidate
+  (`W_PRIZE=0.48, W_HP=0.28, W_BOARD_DEV=0.18, W_HAND=0.05,
+  W_PRESENCE=0.25`) scoring 81.2% on the shrunk-budget gauntlet. Per the
+  standing lesson that shrunk-budget gauntlets are not a reliable proxy,
+  re-verified at **full production budget** vs `agent_v2.py`: **58.0% over
+  50 games (29-21)** -- clears the >55% bar this time (previously 38.0%,
+  rejected). vs-`random` re-checked at 100 games: 82.0%, statistically
+  indistinguishable from the fixed-agent baseline's 87.0%/200-game figure
+  (z~1.15, not significant) and still comfortably above the 80% bar --
+  **promoted and shipped**. `ptcg_ai/train/frozen/agent_v3.py` freezes this
+  as the new baseline for future promotion checks.
+
+This is the first candidate from this pipeline to actually clear the
+promotion bar -- a direct consequence of testing against a correct baseline
+instead of one with a live bug in exactly the mechanism (bench safety under
+Active-already-occupied) that board-presence-weighted heuristics most
+depend on getting board state right for.
+
 ## 5. Deck evolution (`deck_evolve.py`)
 
 ```bash
