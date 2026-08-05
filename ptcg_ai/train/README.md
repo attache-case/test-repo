@@ -1,0 +1,111 @@
+# Training / learning pipeline (Phase 3)
+
+Offline scripts that let the shipped, self-contained `ptcg_ai/agent/main.py`
+improve from experience without becoming non-self-contained: everything
+learned here gets baked back into `main.py` as **literal embedded
+constants** (a `LEARNED_PRIORS` dict, `W_*` weight constants, and the `DECK`
+list). Nothing under `ptcg_ai/train/` is imported by `main.py` or runs at
+Kaggle submission time.
+
+All commands use the project venv: `/home/user/venv-ptcg/bin/python`.
+
+This is a first, deliberately **time-boxed** pass through the whole pipeline
+(a few hundred games per stage, not a converged search) -- see "Scaling up"
+at the end.
+
+## 1. Self-play data generation (`selfplay.py`)
+
+```bash
+/home/user/venv-ptcg/bin/python ptcg_ai/train/selfplay.py --games 250 --self-frac 0.5
+```
+
+Runs a mix of agent-vs-agent and agent-vs-built-in (`random`/`first`) games
+with a shrunk search-time budget (fast, "reasonable" rather than peak play),
+and records one JSONL line per real decision our agent made -- select
+type/context, option types, chosen action, board features, and the game's
+eventual outcome from that decision-maker's perspective -- to
+`ptcg_ai/train/data/*.jsonl` (gitignored; regenerate rather than expecting it
+in git).
+
+Executed so far: **250 games, 15,653 decision records**
+(`selfplay_1785681708.jsonl`).
+
+## 2. Learned action priors (`build_priors.py`)
+
+```bash
+/home/user/venv-ptcg/bin/python ptcg_ai/train/build_priors.py --min-support 8 --max-entries 200
+```
+
+Aggregates the JSONL data into `(select_type, select_context, option_type)
+-> Laplace-smoothed win-rate`, drops keys with fewer than `--min-support`
+observations, and writes `ptcg_ai/train/artifacts/action_priors.json` (small,
+committed) plus a ready-to-paste `LEARNED_PRIORS` literal for `main.py`.
+`main.py` uses this table two ways, both with a graceful fallback to the
+pre-existing hand-tuned tiers when a key is unseen or the table is empty:
+(i) weighted sampling within a playout-policy tier instead of uniform choice;
+(ii) prior-ranked (instead of random) truncation of the candidate list when
+it exceeds `CANDIDATE_CAP`.
+
+Executed so far: **19 keys** kept (out of 19 observed -- the state space of
+`(select_type, context, option_type)` triples is much smaller than raw game
+states, so even 250 games gives reasonable support for most of them).
+
+## 3. Eval-weight tuning (`tune_weights.py`)
+
+```bash
+/home/user/venv-ptcg/bin/python ptcg_ai/train/tune_weights.py --delta 0.08 --games-per-opponent 8
+```
+
+One round of coordinate descent over `(W_PRIZE, W_HP, W_BOARD_DEV, W_HAND,
+W_PRESENCE)`: try +/-delta on each weight in turn, score every candidate
+vector over a small gauntlet (`random` + `first`, alternating seats, shrunk
+time budget), keep whichever vector (including the untouched baseline)
+scores best. Prints the winning vector; copying it into `main.py`'s `W_*`
+constants and re-verifying with `run_eval.py` is a manual step so a human
+signs off before shipping a behavior change.
+
+## 4. League check / promotion gate (`league_check.py`)
+
+```bash
+/home/user/venv-ptcg/bin/python ptcg_ai/train/league_check.py --frozen ptcg_ai/train/frozen/agent_v1.py --games 50
+```
+
+Head-to-head, current `main.py` vs a frozen snapshot, at full search budget.
+**Promotion rule** (applies to any change -- priors, weights, or deck):
+the candidate must beat its immediate predecessor >55% over >=50 games
+*and* keep the vs-`random` winrate intact (re-check with `run_eval.py`)
+before it's considered shipped. `ptcg_ai/train/frozen/agent_v1.py` is the
+Phase-1/2 snapshot (commit `9e4a962`) frozen as the first league baseline;
+never delete frozen snapshots -- add `agent_v2.py`, `agent_v3.py`, etc. as
+the baseline advances.
+
+## 5. Deck evolution (`deck_evolve.py`)
+
+```bash
+/home/user/venv-ptcg/bin/python ptcg_ai/train/deck_evolve.py --generations 2 --population 4 --games-per-matchup 20
+```
+
+Evolutionary search over decks, seeded from the current default. Mutation
+swaps 1-3 cards and is validated against the **empirically-verified engine
+rules** (60 cards; max 4 copies per `cardId` except Basic Energy 1-8, which
+is uncapped; >=1 Basic Pokemon required; at most 1 ACE SPEC card total) via
+a real `lib.BattleStart` call before a mutant is even considered -- invalid
+mutants are rejected outright rather than mis-scored. Selection: round-robin
+winrate with our own agent piloting both sides. A mutant is only promoted to
+"incumbent" within the run if it beats the current incumbent by the same
+60% bar used for the hand-built Phase-2 candidates; the log
+(`ptcg_ai/train/artifacts/deck_evolution.md`, committed) records every
+mutant tried and its composition, win/loss lineage included, so the search
+is auditable even when nothing gets promoted.
+
+## Scaling up
+
+Every stage above ran at a deliberately small scale (250 self-play games, one
+coordinate-descent round, 2 generations x 4 mutants for deck evolution) to
+keep the initial pipeline fast and auditable end-to-end. If a given stage's
+results look like they're moving winrates (check `strategy_report.md` for the
+numbers actually observed), the natural next steps are: more self-play games
+and a lower `--min-support` for a bigger prior table; more coordinate-descent
+rounds or a proper SPSA loop for weights; a wider mutation operator and more
+generations/population for deck evolution, evaluated against a full gauntlet
+(random + first + several frozen ancestors) rather than a single incumbent.
