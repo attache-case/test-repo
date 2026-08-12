@@ -270,8 +270,8 @@ FILLER_CARD_ID = 3            # Basic {W} Energy -- padding for determinization 
 # with zero Pokemon in play on our side; the old weights (prize/hp/board/hand)
 # didn't explicitly reward keeping spare Pokemon in reserve.
 W_PRIZE = 0.48
-W_HP = 0.24
-W_BOARD_DEV = 0.22
+W_HP = 0.28
+W_BOARD_DEV = 0.18
 W_HAND = 0.05
 W_PRESENCE = 0.25
 PRESENCE_CAP = 3  # Pokemon count beyond which extra copies stop adding safety value

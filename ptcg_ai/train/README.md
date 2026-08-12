@@ -77,7 +77,72 @@ the candidate must beat its immediate predecessor >55% over >=50 games
 before it's considered shipped. `ptcg_ai/train/frozen/agent_v1.py` is the
 Phase-1/2 snapshot (commit `9e4a962`) frozen as the first league baseline;
 never delete frozen snapshots -- add `agent_v2.py`, `agent_v3.py`, etc. as
-the baseline advances.
+the baseline advances. Current baseline for new promotion checks:
+`agent_v4.py` (post-bugfix, weight-round-2) -- see "Further strengthening
+pass" below for the full lineage.
+
+## Re-validation after the official-source bugfix round (commit `004c94e`)
+
+The `inPlayArea` bugfix (bench_basic_override/rescue bias silently missing
+the "Active occupied, second Basic goes to Bench" case) meant every
+promotion decision made *before* that fix used a weaker version of the
+agent on one side of every comparison, including this project's own
+promotion history. Re-ran the rejected candidates against a fresh frozen
+baseline (`ptcg_ai/train/frozen/agent_v2.py`, the fixed agent, pre-weight-
+retuning) rather than assuming the old verdicts still held:
+
+- **Learned priors**: 48.0% over 50 games vs `agent_v2.py` -- still **not
+  promoted** (same conclusion as before the bugfix, still parity).
+- **Tuned weights**: a fresh `tune_weights.py` pass found a new candidate
+  (`W_PRIZE=0.48, W_HP=0.28, W_BOARD_DEV=0.18, W_HAND=0.05,
+  W_PRESENCE=0.25`) scoring 81.2% on the shrunk-budget gauntlet. Per the
+  standing lesson that shrunk-budget gauntlets are not a reliable proxy,
+  re-verified at **full production budget** vs `agent_v2.py`: **58.0% over
+  50 games (29-21)** -- clears the >55% bar this time (previously 38.0%,
+  rejected). vs-`random` re-checked at 100 games: 82.0%, statistically
+  indistinguishable from the fixed-agent baseline's 87.0%/200-game figure
+  (z~1.15, not significant) and still comfortably above the 80% bar --
+  **promoted and shipped**. `ptcg_ai/train/frozen/agent_v3.py` freezes this
+  as the new baseline for future promotion checks.
+
+This is the first candidate from this pipeline to actually clear the
+promotion bar -- a direct consequence of testing against a correct baseline
+instead of one with a live bug in exactly the mechanism (bench safety under
+Active-already-occupied) that board-presence-weighted heuristics most
+depend on getting board state right for.
+
+## Further strengthening pass (post-`agent_v3`)
+
+Two more experiments, both against `agent_v3.py` as predecessor:
+
+- **Time budget increase (negative result)**: with the correctness bugs
+  fixed, checked whether the agent was leaving compute on the table --
+  the `cabt` environment gives each player a 600s-per-game overage-time
+  bank (`actTimeout=0`, `remainingOverageTime` starts at 600) and our
+  actual usage was only ~4-13s/game, i.e. under 3% of the budget. Doubled
+  `TARGET_TIME`/`HARD_CAP`/`SETUP_TARGET_TIME`/`SETUP_HARD_CAP`
+  (1.2/3.0/2.5/4.5 -> 3.0/6.0/5.0/8.0s) and re-checked: vs-`random` held
+  (86.7%/60 games, zero timeouts, confirming the larger budget is safe),
+  but head-to-head vs `agent_v3.py` scored only **52.5%/40 games -- DO NOT
+  PROMOTE**, indistinguishable from a coin flip. More rollouts of the same
+  biased-random playout policy hit diminishing returns well before the
+  600s ceiling; the bottleneck is elsewhere (policy/heuristic quality, not
+  rollout count). Reverted to the original budget.
+- **Weight round 2 (promoted)**: a second, finer coordinate-descent pass
+  (`--delta 0.04`, starting from `agent_v3`'s weights) found
+  `W_HP=0.24, W_BOARD_DEV=0.22` (others unchanged) scoring 70.8% on the
+  shrunk-budget gauntlet. Verified at full budget vs `agent_v3.py`:
+  **58.0%/50 games (29-21) -- promoted**. vs-`random` at 100 games:
+  **89.0%** (up from 87.0%, no regression). Frozen as `agent_v4.py`, now
+  the shipped config and the new baseline for future rounds.
+
+Net effect of this pass: the "push time budget" lever is confirmed to be a
+dead end at the current search/policy design (documented so it isn't
+re-tried without a reason to expect a different result), while a second
+weight-tuning round found more real gain along the same axis that worked
+before -- a coordinate-descent search over 5 weights clearly hadn't
+converged after 2 rounds each with a different delta.
+
 
 ## 5. Deck evolution (`deck_evolve.py`)
 
